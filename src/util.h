@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -57,9 +57,26 @@ unsigned long get_tick_count(void);
 
 char *dir_name(char *path);
 
+int get_uid_gid(uid_t *uid, gid_t *gid);
+
+int drop_root_privilege(void);
+
+int create_dir_with_perm(const char *dir_path);
+
 char *get_host_by_addr(char *host, int maxsize, struct sockaddr *addr);
 
+int generate_random_addr(unsigned char *addr, int addr_len, int mask);
+
+int generate_addr_map(const unsigned char *addr_from, const unsigned char *addr_to, unsigned char *addr_out,
+					  int addr_len, int mask);
+
+int is_private_addr(const unsigned char *addr, int addr_len);
+
+int is_private_addr_sockaddr(struct sockaddr *addr, socklen_t addr_len);
+
 int getaddr_by_host(const char *host, struct sockaddr *addr, socklen_t *addr_len);
+
+int get_raw_addr_by_ip(const char *ip, unsigned char *raw_addr, int *raw_addr_len);
 
 int getsocket_inet(int fd, struct sockaddr *addr, socklen_t *addr_len);
 
@@ -69,11 +86,17 @@ int parse_ip(const char *value, char *ip, int *port);
 
 int check_is_ipaddr(const char *ip);
 
-int parse_uri(char *value, char *scheme, char *host, int *port, char *path);
+int check_is_ipv4(const char *ip);
 
-int parse_uri_ext(char *value, char *scheme, char *user, char *password, char *host, int *port, char *path);
+int check_is_ipv6(const char *ip);
 
-void urldecode(char *dst, const char *src);
+int parser_mac_address(const char *in_mac, uint8_t mac[6]);
+
+int parse_uri(const char *value, char *scheme, char *host, int *port, char *path);
+
+int parse_uri_ext(const char *value, char *scheme, char *user, char *password, char *host, int *port, char *path);
+
+int urldecode(char *dst, int dst_maxlen, const char *src);
 
 int set_fd_nonblock(int fd, int nonblock);
 
@@ -87,19 +110,27 @@ int ipset_add(const char *ipset_name, const unsigned char addr[], int addr_len, 
 
 int ipset_del(const char *ipset_name, const unsigned char addr[], int addr_len);
 
+int netlink_get_neighbors(int family,
+						  int (*callback)(const uint8_t *net_addr, int net_addr_len, const uint8_t mac[6], void *arg),
+						  void *arg);
+
 void SSL_CRYPTO_thread_setup(void);
 
 void SSL_CRYPTO_thread_cleanup(void);
 
 unsigned char *SSL_SHA256(const unsigned char *d, size_t n, unsigned char *md);
 
-int SSL_base64_decode(const char *in, unsigned char *out);
+int SSL_base64_decode(const char *in, unsigned char *out, int max_outlen);
+
+int SSL_base64_decode_ext(const char *in, unsigned char *out, int max_outlen, int url_safe, int auto_padding);
 
 int SSL_base64_encode(const void *in, int in_len, char *out);
 
 int generate_cert_key(const char *key_path, const char *cert_path, const char *san, int days);
 
 int create_pid_file(const char *pid_file);
+
+int full_path(char *normalized_path, int normalized_path_len, const char *path);
 
 /* Parse a TLS packet for the Server Name Indication extension in the client
  * hello handshake, returning the first server name found (pointer to static
@@ -118,6 +149,8 @@ int parse_tls_header(const char *data, size_t data_len, char *hostname, const ch
 
 void get_compiled_time(struct tm *tm);
 
+unsigned long get_system_mem_size(void);
+
 int is_numeric(const char *str);
 
 int has_network_raw_cap(void);
@@ -131,6 +164,23 @@ int set_sock_lingertime(int fd, int time);
 uint64_t get_free_space(const char *path);
 
 void print_stack(void);
+
+void close_all_fd(int keepfd);
+
+typedef enum daemon_ret {
+	DAEMON_RET_OK = 0,
+	DAEMON_RET_ERR = -1,
+	DAEMON_RET_CHILD_OK = -2,
+	DAEMON_RET_PARENT_OK = -3,
+} daemon_ret;
+
+daemon_ret daemon_run(int *wstatus);
+
+int daemon_kickoff(int status, int no_close);
+
+int daemon_keepalive(void);
+
+void daemon_close_stdfds(void);
 
 int write_file(const char *filename, void *data, int data_len);
 

@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -40,6 +40,7 @@
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -83,7 +84,6 @@ struct fast_ping_packet_msg {
 	struct timeval tv;
 	unsigned int sid;
 	unsigned int seq;
-	unsigned int cookie;
 };
 
 struct fast_ping_packet {
@@ -93,6 +93,18 @@ struct fast_ping_packet {
 	};
 	unsigned int ttl;
 	struct fast_ping_packet_msg msg;
+};
+
+struct fast_ping_fake_ip {
+	struct hlist_node node;
+	atomic_t ref;
+	PING_TYPE type;
+	FAST_PING_TYPE ping_type;
+	char host[PING_MAX_HOSTLEN];
+	int ttl;
+	float time;
+	struct sockaddr_storage addr;
+	int addr_len;
 };
 
 struct ping_host_struct {
@@ -108,7 +120,7 @@ struct ping_host_struct {
 	char host[PING_MAX_HOSTLEN];
 
 	int fd;
-	unsigned int seq;
+	unsigned short seq;
 	int ttl;
 	struct timeval last;
 	int interval;
@@ -116,8 +128,7 @@ struct ping_host_struct {
 	int count;
 	int send;
 	int run;
-	unsigned int cookie;
-	unsigned int sid;
+	unsigned short sid;
 	unsigned short port;
 	unsigned short ss_family;
 	union {
@@ -127,6 +138,11 @@ struct ping_host_struct {
 	};
 	socklen_t addr_len;
 	struct fast_ping_packet packet;
+	/* for memory address alignment */
+	struct fast_ping_packet recv_packet_buffer;
+
+	struct fast_ping_fake_ip *fake;
+	int fake_time_fd;
 };
 
 struct fast_ping_notify_event {
@@ -163,13 +179,18 @@ struct fast_ping_struct {
 
 	pthread_mutex_t map_lock;
 	DECLARE_HASHTABLE(addrmap, 6);
+	DECLARE_HASHTABLE(fake, 6);
+	int fake_ip_num;
 };
 
+static int is_fast_ping_init;
 static struct fast_ping_struct ping;
 static atomic_t ping_sid = ATOMIC_INIT(0);
 static int bool_print_log = 1;
 
 static void _fast_ping_host_put(struct ping_host_struct *ping_host);
+static int _fast_ping_get_addr_by_type(PING_TYPE type, const char *ip_str, int port, struct addrinfo **out_gai,
+									   FAST_PING_TYPE *out_ping_type);
 
 static void _fast_ping_wakeup_thread(void)
 {
@@ -376,6 +397,179 @@ errout:
 	return -1;
 }
 
+static void _fast_ping_fake_put(struct fast_ping_fake_ip *fake)
+{
+	int ref_cnt = atomic_dec_and_test(&fake->ref);
+	if (!ref_cnt) {
+		if (ref_cnt < 0) {
+			tlog(TLOG_ERROR, "invalid refcount of fake ping %s", fake->host);
+			abort();
+		}
+		return;
+	}
+
+	pthread_mutex_lock(&ping.map_lock);
+	if (hash_hashed(&fake->node)) {
+		hash_del(&fake->node);
+	}
+	pthread_mutex_unlock(&ping.map_lock);
+
+	free(fake);
+}
+
+static void _fast_ping_fake_remove(struct fast_ping_fake_ip *fake)
+{
+	pthread_mutex_lock(&ping.map_lock);
+	if (hash_hashed(&fake->node)) {
+		hash_del(&fake->node);
+	}
+	pthread_mutex_unlock(&ping.map_lock);
+
+	_fast_ping_fake_put(fake);
+}
+
+static void _fast_ping_fake_get(struct fast_ping_fake_ip *fake)
+{
+	atomic_inc(&fake->ref);
+}
+
+static struct fast_ping_fake_ip *_fast_ping_fake_find(FAST_PING_TYPE ping_type, struct sockaddr *addr, int addr_len)
+{
+	struct fast_ping_fake_ip *fake = NULL;
+	struct fast_ping_fake_ip *ret = NULL;
+	uint32_t key = 0;
+
+	if (ping.fake_ip_num == 0) {
+		return NULL;
+	}
+
+	key = jhash(addr, addr_len, 0);
+	key = jhash(&ping_type, sizeof(ping_type), key);
+	pthread_mutex_lock(&ping.map_lock);
+	hash_for_each_possible(ping.fake, fake, node, key)
+	{
+		if (fake->ping_type != ping_type) {
+			continue;
+		}
+
+		if (fake->addr_len != addr_len) {
+			continue;
+		}
+
+		if (memcmp(&fake->addr, addr, fake->addr_len) != 0) {
+			continue;
+		}
+
+		ret = fake;
+		_fast_ping_fake_get(fake);
+		break;
+	}
+	pthread_mutex_unlock(&ping.map_lock);
+	return ret;
+}
+
+int fast_ping_fake_ip_add(PING_TYPE type, const char *host, int ttl, float time)
+{
+	struct fast_ping_fake_ip *fake = NULL;
+	struct fast_ping_fake_ip *fake_old = NULL;
+	char ip_str[PING_MAX_HOSTLEN];
+	int port = -1;
+	FAST_PING_TYPE ping_type = FAST_PING_END;
+	uint32_t key = 0;
+	int ret = -1;
+	struct addrinfo *gai = NULL;
+
+	if (parse_ip(host, ip_str, &port) != 0) {
+		goto errout;
+	}
+
+	ret = _fast_ping_get_addr_by_type(type, ip_str, port, &gai, &ping_type);
+	if (ret != 0) {
+		goto errout;
+	}
+
+	fake_old = _fast_ping_fake_find(ping_type, gai->ai_addr, gai->ai_addrlen);
+	fake = malloc(sizeof(*fake));
+	if (fake == NULL) {
+		goto errout;
+	}
+	memset(fake, 0, sizeof(*fake));
+
+	safe_strncpy(fake->host, ip_str, PING_MAX_HOSTLEN);
+	fake->ttl = ttl;
+	fake->time = time;
+	fake->type = type;
+	fake->ping_type = ping_type;
+	memcpy(&fake->addr, gai->ai_addr, gai->ai_addrlen);
+	fake->addr_len = gai->ai_addrlen;
+	INIT_HLIST_NODE(&fake->node);
+	atomic_set(&fake->ref, 1);
+
+	key = jhash(&fake->addr, fake->addr_len, 0);
+	key = jhash(&ping_type, sizeof(ping_type), key);
+	pthread_mutex_lock(&ping.map_lock);
+	hash_add(ping.fake, &fake->node, key);
+	pthread_mutex_unlock(&ping.map_lock);
+	ping.fake_ip_num++;
+
+	if (fake_old != NULL) {
+		_fast_ping_fake_put(fake_old);
+		_fast_ping_fake_remove(fake_old);
+	}
+
+	freeaddrinfo(gai);
+	return 0;
+errout:
+	if (fake != NULL) {
+		free(fake);
+	}
+
+	if (fake_old != NULL) {
+		_fast_ping_fake_put(fake_old);
+	}
+
+	if (gai != NULL) {
+		freeaddrinfo(gai);
+	}
+
+	return -1;
+}
+
+int fast_ping_fake_ip_remove(PING_TYPE type, const char *host)
+{
+	struct fast_ping_fake_ip *fake = NULL;
+	char ip_str[PING_MAX_HOSTLEN];
+	int port = -1;
+	int ret = -1;
+	FAST_PING_TYPE ping_type = FAST_PING_END;
+	struct addrinfo *gai = NULL;
+
+	if (parse_ip(host, ip_str, &port) != 0) {
+		return -1;
+	}
+
+	ret = _fast_ping_get_addr_by_type(type, ip_str, port, &gai, &ping_type);
+	if (ret != 0) {
+		goto errout;
+	}
+
+	fake = _fast_ping_fake_find(ping_type, gai->ai_addr, gai->ai_addrlen);
+	if (fake == NULL) {
+		goto errout;
+	}
+
+	_fast_ping_fake_remove(fake);
+	_fast_ping_fake_put(fake);
+	ping.fake_ip_num--;
+	freeaddrinfo(gai);
+	return 0;
+errout:
+	if (gai != NULL) {
+		freeaddrinfo(gai);
+	}
+	return -1;
+}
+
 static void _fast_ping_host_get(struct ping_host_struct *ping_host)
 {
 	if (atomic_inc_return(&ping_host->ref) <= 0) {
@@ -386,6 +580,15 @@ static void _fast_ping_host_get(struct ping_host_struct *ping_host)
 
 static void _fast_ping_close_host_sock(struct ping_host_struct *ping_host)
 {
+	if (ping_host->fake_time_fd > 0) {
+		struct epoll_event *event = NULL;
+		event = (struct epoll_event *)1;
+		epoll_ctl(ping.epoll_fd, EPOLL_CTL_DEL, ping_host->fake_time_fd, event);
+
+		close(ping_host->fake_time_fd);
+		ping_host->fake_time_fd = -1;
+	}
+
 	if (ping_host->fd < 0) {
 		return;
 	}
@@ -455,6 +658,10 @@ static void _fast_ping_host_put(struct ping_host_struct *ping_host)
 	}
 
 	_fast_ping_close_host_sock(ping_host);
+	if (ping_host->fake != NULL) {
+		_fast_ping_fake_put(ping_host->fake);
+		ping_host->fake = NULL;
+	}
 
 	pthread_mutex_lock(&ping.map_lock);
 	hash_del(&ping_host->addr_node);
@@ -503,6 +710,11 @@ static int _fast_ping_sendping_v6(struct ping_host_struct *ping_host)
 	struct icmp6_hdr *icmp6 = &packet->icmp6;
 	int len = 0;
 
+	if (ping.fd_icmp6 <= 0) {
+		errno = EADDRNOTAVAIL;
+		goto errout;
+	}
+
 	ping_host->seq++;
 	memset(icmp6, 0, sizeof(*icmp6));
 	icmp6->icmp6_type = ICMP6_ECHO_REQUEST;
@@ -514,15 +726,18 @@ static int _fast_ping_sendping_v6(struct ping_host_struct *ping_host)
 	gettimeofday(&packet->msg.tv, NULL);
 	gettimeofday(&ping_host->last, NULL);
 	packet->msg.sid = ping_host->sid;
-	packet->msg.cookie = ping_host->cookie;
 	packet->msg.seq = ping_host->seq;
 	icmp6->icmp6_cksum = _fast_ping_checksum((void *)packet, sizeof(struct fast_ping_packet));
 
 	len = sendto(ping.fd_icmp6, &ping_host->packet, sizeof(struct fast_ping_packet), 0, &ping_host->addr,
 				 ping_host->addr_len);
-	if (len < 0 || len != sizeof(struct fast_ping_packet)) {
+	if (len != sizeof(struct fast_ping_packet)) {
 		int err = errno;
 		if (errno == ENETUNREACH || errno == EINVAL || errno == EADDRNOTAVAIL || errno == EHOSTUNREACH) {
+			goto errout;
+		}
+
+		if (is_private_addr_sockaddr(&ping_host->addr, ping_host->addr_len)) {
 			goto errout;
 		}
 
@@ -539,6 +754,38 @@ static int _fast_ping_sendping_v6(struct ping_host_struct *ping_host)
 			 ping_host->sid, strerror(err));
 		goto errout;
 	}
+
+	return 0;
+
+errout:
+	return -1;
+}
+
+static int _fast_ping_send_fake(struct ping_host_struct *ping_host, struct fast_ping_fake_ip *fake)
+{
+	struct itimerspec its;
+	int sec = fake->time / 1000;
+	int cent_usec = ((long)(fake->time * 10)) % 10000;
+	its.it_value.tv_sec = sec;
+	its.it_value.tv_nsec = cent_usec * 1000 * 100;
+	its.it_interval.tv_sec = 0;
+	its.it_interval.tv_nsec = 0;
+
+	if (timerfd_settime(ping_host->fake_time_fd, 0, &its, NULL) < 0) {
+		tlog(TLOG_ERROR, "timerfd_settime failed, %s", strerror(errno));
+		goto errout;
+	}
+
+	struct epoll_event ev;
+	ev.events = EPOLLIN;
+	ev.data.ptr = ping_host;
+	if (epoll_ctl(ping.epoll_fd, EPOLL_CTL_ADD, ping_host->fake_time_fd, &ev) == -1) {
+		if (errno != EEXIST) {
+			goto errout;
+		}
+	}
+
+	ping_host->seq++;
 
 	return 0;
 
@@ -564,11 +811,10 @@ static int _fast_ping_sendping_v4(struct ping_host_struct *ping_host)
 	gettimeofday(&ping_host->last, NULL);
 	packet->msg.sid = ping_host->sid;
 	packet->msg.seq = ping_host->seq;
-	packet->msg.cookie = ping_host->cookie;
 	icmp->icmp_cksum = _fast_ping_checksum((void *)packet, sizeof(struct fast_ping_packet));
 
 	len = sendto(ping.fd_icmp, packet, sizeof(struct fast_ping_packet), 0, &ping_host->addr, ping_host->addr_len);
-	if (len < 0 || len != sizeof(struct fast_ping_packet)) {
+	if (len != sizeof(struct fast_ping_packet)) {
 		int err = errno;
 		if (errno == ENETUNREACH || errno == EINVAL || errno == EADDRNOTAVAIL || errno == EPERM || errno == EACCES) {
 			goto errout;
@@ -620,7 +866,7 @@ static int _fast_ping_sendping_udp(struct ping_host_struct *ping_host)
 
 	gettimeofday(&ping_host->last, NULL);
 	len = sendto(fd, &dns_head, sizeof(dns_head), 0, &ping_host->addr, ping_host->addr_len);
-	if (len < 0 || len != sizeof(dns_head)) {
+	if (len != sizeof(dns_head)) {
 		int err = errno;
 		if (errno == ENETUNREACH || errno == EINVAL || errno == EADDRNOTAVAIL || errno == EPERM || errno == EACCES) {
 			goto errout;
@@ -710,7 +956,15 @@ errout:
 static int _fast_ping_sendping(struct ping_host_struct *ping_host)
 {
 	int ret = -1;
+	struct fast_ping_fake_ip *fake = NULL;
 	gettimeofday(&ping_host->last, NULL);
+
+	fake = _fast_ping_fake_find(ping_host->type, &ping_host->addr, ping_host->addr_len);
+	if (fake) {
+		ret = _fast_ping_send_fake(ping_host, fake);
+		_fast_ping_fake_put(fake);
+		return ret;
+	}
 
 	if (ping_host->type == FAST_PING_ICMP) {
 		ret = _fast_ping_sendping_v4(ping_host);
@@ -784,7 +1038,7 @@ static int _fast_ping_create_icmp_sock(FAST_PING_TYPE type)
 				}
 				bool_print_log = 0;
 			}
-			tlog(TLOG_ERROR, "create icmp socket failed, %s\n", strerror(errno));
+			tlog(TLOG_INFO, "create icmpv6 socket failed, %s\n", strerror(errno));
 			goto errout;
 		}
 		setsockopt(fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof(on));
@@ -1010,13 +1264,18 @@ static int _fast_ping_get_addr_by_icmp(const char *ip_str, int port, struct addr
 		goto errout;
 	}
 
-	gai = _fast_ping_getaddr(ip_str, service, socktype, sockproto);
-	if (gai == NULL) {
-		goto errout;
+	if (out_gai != NULL) {
+		gai = _fast_ping_getaddr(ip_str, service, socktype, sockproto);
+		if (gai == NULL) {
+			goto errout;
+		}
+
+		*out_gai = gai;
 	}
 
-	*out_gai = gai;
-	*out_ping_type = ping_type;
+	if (out_ping_type != NULL) {
+		*out_ping_type = ping_type;
+	}
 
 	return 0;
 errout:
@@ -1148,8 +1407,9 @@ struct ping_host_struct *fast_ping_start(PING_TYPE type, const char *host, int c
 	char ip_str[PING_MAX_HOSTLEN];
 	int port = -1;
 	FAST_PING_TYPE ping_type = FAST_PING_END;
-	unsigned int seed = 0;
 	int ret = 0;
+	struct fast_ping_fake_ip *fake = NULL;
+	int fake_time_fd = -1;
 
 	if (parse_ip(host, ip_str, &port) != 0) {
 		goto errout;
@@ -1175,8 +1435,6 @@ struct ping_host_struct *fast_ping_start(PING_TYPE type, const char *host, int c
 	atomic_set(&ping_host->ref, 0);
 	atomic_set(&ping_host->notified, 0);
 	ping_host->sid = atomic_inc_return(&ping_sid);
-	seed = ping_host->sid;
-	ping_host->cookie = rand_r(&seed);
 	ping_host->run = 0;
 	if (ping_callback) {
 		ping_host->ping_callback = ping_callback;
@@ -1193,6 +1451,19 @@ struct ping_host_struct *fast_ping_start(PING_TYPE type, const char *host, int c
 	memcpy(&ping_host->addr, gai->ai_addr, gai->ai_addrlen);
 
 	tlog(TLOG_DEBUG, "ping %s, id = %d", host, ping_host->sid);
+
+	fake = _fast_ping_fake_find(ping_host->type, gai->ai_addr, gai->ai_addrlen);
+	if (fake) {
+		fake_time_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+		if (fake_time_fd < 0) {
+			tlog(TLOG_ERROR, "timerfd_create failed, %s", strerror(errno));
+			goto errout;
+		}
+		/* already take ownership by find. */
+		ping_host->fake = fake;
+		ping_host->fake_time_fd = fake_time_fd;
+		fake = NULL;
+	}
 
 	addrkey = _fast_ping_hash_key(ping_host->sid, &ping_host->addr);
 
@@ -1229,6 +1500,14 @@ errout:
 		free(ping_host);
 	}
 
+	if (fake_time_fd > 0) {
+		close(fake_time_fd);
+	}
+
+	if (fake) {
+		_fast_ping_fake_put(fake);
+	}
+
 	return NULL;
 }
 
@@ -1261,6 +1540,11 @@ static struct fast_ping_packet *_fast_ping_icmp6_packet(struct ping_host_struct 
 	struct icmp6_hdr *icmp6 = &packet->icmp6;
 	struct cmsghdr *c = NULL;
 	int hops = 0;
+
+	if (data_len < (int)sizeof(struct icmp6_hdr)) {
+		tlog(TLOG_DEBUG, "ping package length is invalid, %d, %d", data_len, (int)sizeof(struct fast_ping_packet));
+		return NULL;
+	}
 
 	for (c = CMSG_FIRSTHDR(msg); c; c = CMSG_NXTHDR(msg, c)) {
 		if (c->cmsg_level != IPPROTO_IPV6) {
@@ -1309,12 +1593,32 @@ static struct fast_ping_packet *_fast_ping_icmp_packet(struct ping_host_struct *
 	int hlen = 0;
 	int icmp_len = 0;
 
-	hlen = ip->ip_hl << 2;
-	packet = (struct fast_ping_packet *)(packet_data + hlen);
+	if (ping.no_unprivileged_ping) {
+		hlen = ip->ip_hl << 2;
+		if (ip->ip_p != IPPROTO_ICMP) {
+			tlog(TLOG_DEBUG, "ip type failed, %d:%d", ip->ip_p, IPPROTO_ICMP);
+			return NULL;
+		}
+	}
+
+	if (data_len - hlen < (int)sizeof(struct icmp)) {
+		tlog(TLOG_DEBUG, "response ping package length is invalid, len: %d", data_len);
+		return NULL;
+	}
+
+	if ((uintptr_t)(packet_data + hlen) % __alignof__(void *) == 0 || ping.no_unprivileged_ping == 0) {
+		packet = (struct fast_ping_packet *)(packet_data + hlen);
+	} else {
+		int copy_len = sizeof(ping_host->recv_packet_buffer);
+		if (copy_len > data_len - hlen) {
+			copy_len = data_len - hlen;
+		}
+		memcpy(&ping_host->recv_packet_buffer, packet_data + hlen, copy_len);
+		packet = &ping_host->recv_packet_buffer;
+	}
+
 	icmp = &packet->icmp;
 	icmp_len = data_len - hlen;
-	packet->ttl = ip->ip_ttl;
-
 	if (icmp_len < 16) {
 		tlog(TLOG_ERROR, "length is invalid, %d", icmp_len);
 		return NULL;
@@ -1325,18 +1629,12 @@ static struct fast_ping_packet *_fast_ping_icmp_packet(struct ping_host_struct *
 		return NULL;
 	}
 
-	if (ping.no_unprivileged_ping) {
-		if (ip->ip_p != IPPROTO_ICMP) {
-			tlog(TLOG_ERROR, "ip type failed, %d:%d", ip->ip_p, IPPROTO_ICMP);
-			return NULL;
-		}
-
-		if (icmp->icmp_id != ping.ident) {
-			tlog(TLOG_ERROR, "ident failed, %d:%d", icmp->icmp_id, ping.ident);
-			return NULL;
-		}
+	if (icmp->icmp_id != ping.ident && ping.no_unprivileged_ping) {
+		tlog(TLOG_WARN, "ident failed, %d:%d", icmp->icmp_id, ping.ident);
+		return NULL;
 	}
 
+	packet->ttl = ip->ip_ttl;
 	return packet;
 }
 
@@ -1365,6 +1663,33 @@ errout:
 	return NULL;
 }
 
+static int _fast_ping_process_fake(struct ping_host_struct *ping_host, struct timeval *now)
+{
+	struct timeval tvresult = *now;
+	struct timeval *tvsend = &ping_host->last;
+	uint64_t exp;
+	int ret;
+
+	ret = read(ping_host->fake_time_fd, &exp, sizeof(uint64_t));
+	if (ret < 0) {
+		return -1;
+	}
+
+	ping_host->ttl = ping_host->fake->ttl;
+	tv_sub(&tvresult, tvsend);
+	if (ping_host->ping_callback) {
+		_fast_ping_send_notify_event(ping_host, PING_RESULT_RESPONSE, ping_host->seq, ping_host->ttl, &tvresult);
+	}
+
+	ping_host->send = 0;
+
+	if (ping_host->count == 1) {
+		_fast_ping_host_remove(ping_host);
+	}
+
+	return 0;
+}
+
 static int _fast_ping_process_icmp(struct ping_host_struct *ping_host, struct timeval *now)
 {
 	int len = 0;
@@ -1378,7 +1703,6 @@ static int _fast_ping_process_icmp(struct ping_host_struct *ping_host, struct ti
 	struct timeval *tvsend = NULL;
 	unsigned int sid = 0;
 	unsigned int seq = 0;
-	unsigned int cookie = 0;
 	struct msghdr msg;
 	struct iovec iov;
 	char ans_data[4096];
@@ -1415,14 +1739,13 @@ static int _fast_ping_process_icmp(struct ping_host_struct *ping_host, struct ti
 	tvsend = &packet->msg.tv;
 	sid = packet->msg.sid;
 	seq = packet->msg.seq;
-	cookie = packet->msg.cookie;
 	addrkey = _fast_ping_hash_key(sid, (struct sockaddr *)&from);
 	pthread_mutex_lock(&ping.map_lock);
 	hash_for_each_possible(ping.addrmap, recv_ping_host, addr_node, addrkey)
 	{
 		if (_fast_ping_sockaddr_ip_cmp(&recv_ping_host->addr, recv_ping_host->addr_len, (struct sockaddr *)&from,
 									   from_len) == 0 &&
-			recv_ping_host->sid == sid && recv_ping_host->cookie == cookie) {
+			recv_ping_host->sid == sid) {
 			_fast_ping_host_get(recv_ping_host);
 			break;
 		}
@@ -1592,6 +1915,11 @@ static int _fast_ping_process(struct ping_host_struct *ping_host, struct epoll_e
 {
 	int ret = -1;
 
+	if (ping_host->fake != NULL) {
+		ret = _fast_ping_process_fake(ping_host, now);
+		return ret;
+	}
+
 	switch (ping_host->type) {
 	case FAST_PING_ICMP6:
 	case FAST_PING_ICMP:
@@ -1632,6 +1960,18 @@ static void _fast_ping_remove_all(void)
 	list_for_each_entry_safe(ping_host, ping_host_tmp, &remove_list, action_list)
 	{
 		_fast_ping_host_remove(ping_host);
+	}
+}
+
+static void _fast_ping_remove_all_fake_ip(void)
+{
+	struct fast_ping_fake_ip *fake = NULL;
+	struct hlist_node *tmp = NULL;
+	unsigned long i = 0;
+
+	hash_for_each_safe(ping.fake, i, tmp, fake, node)
+	{
+		_fast_ping_fake_put(fake);
 	}
 }
 
@@ -1869,6 +2209,10 @@ int fast_ping_init(void)
 	int ret = 0;
 	bool_print_log = 1;
 
+	if (is_fast_ping_init == 1) {
+		return -1;
+	}
+
 	if (ping.epoll_fd > 0) {
 		return -1;
 	}
@@ -1890,10 +2234,12 @@ int fast_ping_init(void)
 	INIT_LIST_HEAD(&ping.notify_event_list);
 
 	hash_init(ping.addrmap);
+	hash_init(ping.fake);
 	ping.no_unprivileged_ping = !has_unprivileged_ping();
 	ping.ident = (getpid() & 0XFFFF);
 	atomic_set(&ping.run, 1);
 
+	ping.epoll_fd = epollfd;
 	ret = pthread_create(&ping.tid, &attr, _fast_ping_work, NULL);
 	if (ret != 0) {
 		tlog(TLOG_ERROR, "create ping work thread failed, %s\n", strerror(ret));
@@ -1906,13 +2252,13 @@ int fast_ping_init(void)
 		goto errout;
 	}
 
-	ping.epoll_fd = epollfd;
 	ret = _fast_ping_init_wakeup_event();
 	if (ret != 0) {
 		tlog(TLOG_ERROR, "init wakeup event failed, %s\n", strerror(errno));
 		goto errout;
 	}
 
+	is_fast_ping_init = 1;
 	return 0;
 errout:
 	if (ping.notify_tid) {
@@ -1933,6 +2279,7 @@ errout:
 
 	if (epollfd > 0) {
 		close(epollfd);
+		ping.epoll_fd = -1;
 	}
 
 	if (ping.event_fd) {
@@ -1974,6 +2321,10 @@ static void _fast_ping_close_fds(void)
 
 void fast_ping_exit(void)
 {
+	if (is_fast_ping_init == 0) {
+		return;
+	}
+
 	if (ping.notify_tid) {
 		void *retval = NULL;
 		atomic_set(&ping.run, 0);
@@ -1997,10 +2348,13 @@ void fast_ping_exit(void)
 
 	_fast_ping_close_fds();
 	_fast_ping_remove_all();
+	_fast_ping_remove_all_fake_ip();
 	_fast_ping_remove_all_notify_event();
 
 	pthread_cond_destroy(&ping.notify_cond);
 	pthread_mutex_destroy(&ping.notify_lock);
 	pthread_mutex_destroy(&ping.lock);
 	pthread_mutex_destroy(&ping.map_lock);
+
+	is_fast_ping_init = 0;
 }

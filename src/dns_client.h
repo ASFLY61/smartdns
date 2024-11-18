@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,18 +21,29 @@
 
 #include "dns.h"
 
-#ifdef __cpluscplus
+#ifdef __cplusplus
 extern "C" {
 #endif
 
+#define DNS_SERVER_IFNAME_LEN 16
 #define DNS_SERVER_SPKI_LEN 64
 #define DNS_SERVER_GROUP_DEFAULT "default"
+#define DNS_SERVER_GROUP_MDNS "mdns"
+#define DNS_SERVER_GROUP_LOCAL "local"
+#ifdef TEST
+#define DNS_MDNS_IP "127.0.0.1"
+#define DNS_MDNS_PORT 55353
+#else
+#define DNS_MDNS_IP "224.0.0.251"
+#define DNS_MDNS_PORT 5353
+#endif
 
 typedef enum {
 	DNS_SERVER_UDP,
 	DNS_SERVER_TCP,
 	DNS_SERVER_TLS,
 	DNS_SERVER_HTTPS,
+	DNS_SERVER_MDNS,
 	DNS_SERVER_TYPE_END,
 } dns_server_type_t;
 
@@ -49,6 +60,7 @@ typedef enum dns_result_type {
 
 #define DNS_QUEY_OPTION_ECS_DNS (1 << 0)
 #define DNS_QUEY_OPTION_ECS_IP (1 << 1)
+#define DNS_QUEY_OPTION_EDNS0_DO (1 << 2)
 
 int dns_client_init(void);
 
@@ -56,6 +68,11 @@ int dns_client_set_ecs(char *ip, int subnet);
 
 struct dns_server_info;
 /* query result notify function */
+#define DNS_CLIENT_ACTION_OK 0
+#define DNS_CLIENT_ACTION_UNDEFINE (-1)
+#define DNS_CLIENT_ACTION_DROP (-2)
+#define DNS_CLIENT_ACTION_RETRY (-3)
+#define DNS_CLIENT_ACTION_MAY_RETRY (-4)
 typedef int (*dns_client_callback)(const char *domain, dns_result_type rtype, struct dns_server_info *server_info,
 								   struct dns_packet *packet, unsigned char *inpacket, int inpacket_len,
 								   void *user_ptr);
@@ -77,6 +94,7 @@ struct dns_query_options {
 	unsigned long long enable_flag;
 	struct dns_opt_ecs ecs_dns;
 	struct dns_query_ecs_ip ecs_ip;
+	const char *conf_group_name;
 };
 
 /* query domain */
@@ -87,6 +105,10 @@ void dns_client_exit(void);
 
 struct client_dns_server_flag_udp {
 	int ttl;
+};
+
+struct client_dns_server_flag_mdns {
+	int padding;
 };
 
 struct client_dns_server_flag_tls {
@@ -108,21 +130,36 @@ struct client_dns_server_flag_https {
 	char skip_check_cert;
 };
 
+struct client_dns_server_flag_ecs {
+	int enable;
+	char ip[DNS_MAX_CNAME_LEN];
+	int subnet;
+};
+
 struct client_dns_server_flags {
 	dns_server_type_t type;
 	unsigned int server_flag;
 	unsigned int result_flag;
 	long long set_mark;
+	int tcp_keepalive;
 	int drop_packet_latency_ms;
+
 	char proxyname[DNS_MAX_CNAME_LEN];
+	char ifname[DNS_SERVER_IFNAME_LEN];
+
+	int subnet_all_query_types;
+	struct client_dns_server_flag_ecs ipv4_ecs;
+	struct client_dns_server_flag_ecs ipv6_ecs;
+
 	union {
 		struct client_dns_server_flag_udp udp;
 		struct client_dns_server_flag_tls tls;
 		struct client_dns_server_flag_https https;
+		struct client_dns_server_flag_mdns mdns;
 	};
 };
 
-int dns_client_spki_decode(const char *spki, unsigned char *spki_data_out);
+int dns_client_spki_decode(const char *spki, unsigned char *spki_data_out, int spki_data_out_max_len);
 
 /* add remote dns server */
 int dns_client_add_server(char *server_ip, int port, dns_server_type_t server_type,
@@ -141,9 +178,11 @@ int dns_client_remove_from_group(const char *group_name, char *server_ip, int po
 
 int dns_client_remove_group(const char *group_name);
 
+int dns_server_alive_num(void);
+
 int dns_server_num(void);
 
-#ifdef __cpluscplus
+#ifdef __cplusplus
 }
 #endif
 #endif

@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+# Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
 #
 # smartdns is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -48,7 +48,9 @@ build()
 	mkdir $ROOT/root/etc/init.d -p
 	mkdir $ROOT/root/etc/smartdns/ -p
 	mkdir $ROOT/root/etc/smartdns/domain-set/ -p 
+	mkdir $ROOT/root/etc/smartdns/ip-set/ -p 
 	mkdir $ROOT/root/etc/smartdns/conf.d/ -p 
+	mkdir $ROOT/root/etc/smartdns/download/ -p 
 
 	cp $SMARTDNS_CONF  $ROOT/root/etc/smartdns/
 	cp $ADDRESS_CONF $ROOT/root/etc/smartdns/
@@ -72,6 +74,10 @@ build()
 	sed -i "s/^\(bind .*\):53/\1:6053/g" $ROOT/root/etc/smartdns/smartdns.conf
 	if [ ! -z "$INST_SIZE" ]; then
 		echo "Installed-Size: $INST_SIZE" >> $ROOT/control/control
+	fi
+
+	if [ "$STATIC" = "yes" ]; then
+		sed -i "s/Depends:.*/Depends: libc/" $ROOT/control/control
 	fi
 
 	cd $ROOT/control

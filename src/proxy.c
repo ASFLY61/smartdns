@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -95,8 +95,9 @@ struct proxy_struct {
 };
 
 static struct proxy_struct proxy;
+static int is_proxy_init;
 
-const char *proxy_socks5_status_code[] = {
+static const char *proxy_socks5_status_code[] = {
 	"success",
 	"general SOCKS server failure",
 	"connection not allowed by ruleset",
@@ -234,7 +235,7 @@ int proxy_remove(const char *proxy_name)
 
 static void _proxy_remove_all(void)
 {
-	struct proxy_server_info *server_info;
+	struct proxy_server_info *server_info = NULL;
 	struct hlist_node *tmp = NULL;
 	unsigned int i = 0;
 
@@ -542,7 +543,7 @@ static proxy_handshake_state _proxy_handshake_socks5(struct proxy_conn *proxy_co
 			return PROXY_HANDSHAKE_ERR;
 		}
 
-		tlog(TLOG_INFO, "server %s select auth method is %d", proxy_conn->server_info->proxy_name,
+		tlog(TLOG_DEBUG, "server %s select auth method is %d", proxy_conn->server_info->proxy_name,
 			 proxy_conn->buffer.buffer[1]);
 		if (proxy_conn->buffer.buffer[1] == PROXY_SOCKS5_AUTH_USER_PASS) {
 			return _proxy_handshake_socks5_send_auth(proxy_conn);
@@ -592,7 +593,7 @@ static proxy_handshake_state _proxy_handshake_socks5(struct proxy_conn *proxy_co
 			return PROXY_HANDSHAKE_ERR;
 		}
 
-		tlog(TLOG_INFO, "server %s auth success", proxy_conn->server_info->proxy_name);
+		tlog(TLOG_DEBUG, "server %s auth success", proxy_conn->server_info->proxy_name);
 		proxy_conn->state = PROXY_CONN_CONNECTING;
 		return _proxy_handshake_socks5_reply_connect_addr(proxy_conn);
 	case PROXY_CONN_CONNECTING: {
@@ -720,7 +721,7 @@ static proxy_handshake_state _proxy_handshake_socks5(struct proxy_conn *proxy_co
 		}
 
 		proxy_conn->state = PROXY_CONN_CONNECTED;
-		tlog(TLOG_INFO, "success connect to socks5 proxy server %s", proxy_conn->server_info->proxy_name);
+		tlog(TLOG_DEBUG, "success connect to socks5 proxy server %s", proxy_conn->server_info->proxy_name);
 		return PROXY_HANDSHAKE_CONNECTED;
 	} break;
 	default:
@@ -802,7 +803,7 @@ static int _proxy_handshake_http(struct proxy_conn *proxy_conn)
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				return PROXY_HANDSHAKE_WANT_READ;
 			}
-			
+
 			if (len == 0) {
 				tlog(TLOG_ERROR, "remote server %s closed.", proxy_conn->server_info->proxy_name);
 			} else {
@@ -838,7 +839,7 @@ static int _proxy_handshake_http(struct proxy_conn *proxy_conn)
 		if (proxy_conn->buffer.len < 0) {
 			proxy_conn->buffer.len = 0;
 		}
-		tlog(TLOG_INFO, "success connect to http proxy server %s", proxy_conn->server_info->proxy_name);
+		tlog(TLOG_DEBUG, "success connect to http proxy server %s", proxy_conn->server_info->proxy_name);
 		proxy_conn->state = PROXY_CONN_CONNECTED;
 		ret = PROXY_HANDSHAKE_CONNECTED;
 		goto out;
@@ -929,6 +930,11 @@ int proxy_conn_sendto(struct proxy_conn *proxy_conn, const void *buf, size_t len
 		return -1;
 	}
 
+	if (sizeof(buffer) - buffer_len <= len) {
+		errno = ENOSPC;
+		return -1;
+	}
+
 	memcpy(buffer + buffer_len, buf, len);
 	buffer_len += len;
 
@@ -952,7 +958,7 @@ int proxy_conn_recvfrom(struct proxy_conn *proxy_conn, void *buf, size_t len, in
 		return -1;
 	}
 
-	ret = recvfrom(proxy_conn->udp_fd, buffer, sizeof(buffer), MSG_NOSIGNAL, NULL, 0);
+	ret = recvfrom(proxy_conn->udp_fd, buffer, sizeof(buffer), MSG_NOSIGNAL, NULL, NULL);
 	if (ret <= 0) {
 		return -1;
 	}
@@ -1038,15 +1044,26 @@ int proxy_conn_is_udp(struct proxy_conn *proxy_conn)
 	return proxy_conn->is_udp;
 }
 
-int proxy_init()
+int proxy_init(void)
 {
+	if (is_proxy_init == 1) {
+		return -1;
+	}
+
 	memset(&proxy, 0, sizeof(proxy));
 	hash_init(proxy.proxy_server);
+	is_proxy_init = 1;
 	return 0;
 }
 
-int proxy_exit()
+void proxy_exit(void)
 {
+	if (is_proxy_init == 0) {
+		return;
+	}
 	_proxy_remove_all();
-	return 0;
+
+	is_proxy_init = 0;
+	
+	return ;
 }

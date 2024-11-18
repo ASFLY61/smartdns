@@ -1,6 +1,6 @@
 /*
  * tinylog
- * Copyright (C) 2018-2021 Ruilin Peng (Nick) <pymumu@gmail.com>
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>
  * https://github.com/pymumu/tinylog
  */
 
@@ -26,7 +26,8 @@ typedef enum {
     TLOG_WARN = 3,
     TLOG_ERROR = 4,
     TLOG_FATAL = 5,
-    TLOG_END = 6
+    TLOG_OFF = 6,
+    TLOG_END = 7
 } tlog_level;
 
 struct tlog_time {
@@ -64,6 +65,12 @@ struct tlog_time {
 
 /* enable support fork process */
 #define TLOG_SUPPORT_FORK (1 << 5)
+
+/* enable output to screen with color */
+#define TLOG_SCREEN_COLOR (1 << 6)
+
+/* Not output prefix  */
+#define TLOG_FORMAT_NO_PREFIX (1 << 7)
 
 struct tlog_loginfo {
     tlog_level level;
@@ -107,9 +114,6 @@ extern void tlog_set_logfile(const char *logfile);
 /* enable log to screen */
 extern void tlog_setlogscreen(int enable);
 
-/* enable early log to screen */
-extern void tlog_set_early_printf(int enable);
-
 /* Get log level in string */
 extern const char *tlog_get_level_string(tlog_level level);
 
@@ -138,13 +142,23 @@ steps:
 read _tlog_format for example.
 */
 typedef int (*tlog_format_func)(char *buff, int maxlen, struct tlog_loginfo *info, void *userptr, const char *format, va_list ap);
-extern int tlog_reg_format_func(tlog_format_func func);
+extern int tlog_reg_format_func(tlog_format_func callback);
 
 /* register log output callback
  Note: info is invalid when flag TLOG_SEGMENT is not set.
  */
 typedef int (*tlog_log_output_func)(struct tlog_loginfo *info, const char *buff, int bufflen, void *private_data);
 extern int tlog_reg_log_output_func(tlog_log_output_func output, void *private_data);
+
+/* enable early log to screen */
+extern void tlog_set_early_printf(int enable, int no_prefix, int color);
+
+/* set early log callback */
+typedef void (*tlog_early_print_func)(struct tlog_loginfo *loginfo, const char *format, va_list ap);
+extern void tlog_reg_early_printf_callback(tlog_early_print_func callback);
+
+/* set early log output callback */
+extern void tlog_reg_early_printf_output_callback(tlog_log_output_func callback, int log_screen, void *private_data);
 
 struct tlog_log;
 typedef struct tlog_log tlog_log;
@@ -217,6 +231,9 @@ archive: archive file permission, default is 440
 */
 
 extern void tlog_set_permission(struct tlog_log *log, mode_t file, mode_t archive);
+
+/* Utility function, output colored logs to standard output */
+extern int tlog_stdout_with_color(tlog_level level, const char *buff, int bufflen);
 
 #ifdef __cplusplus
 class Tlog {
